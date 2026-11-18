@@ -1,0 +1,418 @@
+
+  "name": "mahdiar",
+  "version": "1.0.1",
+  "description": "مهدیار — تحلیل بنیادی سهام بورس تهران",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
+const fs = require('fs');
+const path = require('path');
+const DATA_DIR = path.join(__dirname, 'data');
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+function fileFor(name) { return path.join(DATA_DIR, String(name).replace(/[\/\\:*?"<>|]/g, '_') + '.json'); }
+function read(name, def) { try { return JSON.parse(fs.readFileSync(fileFor(name), 'utf8')); } catch { return def; } }
+function write(name, obj) { try { const p = fileFor(name); const tmp = p + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8'); fs.renameSync(tmp, p); } catch (e) { console.error('store write error:', e.message); } }
+function exists(name) { try { fs.accessSync(fileFor(name)); return true; } catch { return false; } }
+module.exports = { read, write, exists, DATA_DIR };
+const store = require('./store');
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'fa-IR,fa;q=0.9',
+  'Referer': 'https://codal.ir/',
+  'Origin': 'https://codal.ir'
+};
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const CACHE_TTL = 6 * 3600 * 1000;
+async function searchReports(symbol, letterType) {
+  const p = new URLSearchParams({
+    Audited: 'true', AuditorRef: '-1', Category: '-1', Childs: 'true',
+    CompanyState: '-1', CompanyType: '-1', Consolidatable: 'true',
+    IsNotAudited: 'false', Length: '-1', LetterType: String(letterType),
+    Mains: 'true', NotAudited: 'true', NotConsolidatable: 'true',
+    PageNumber: '1', Publisher: 'false', TracingNo: '-1', search: 'true', Symbol: symbol
+  });
+  const url = 'https://search.codal.ir/api/search/v2/q?' + p.toString();
+  const r = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(15000) });
+  if (!r.ok) throw new Error('Codal HTTP ' + r.status);
+  return r.json();
+}
+function pickFields(l) {
+  return {
+    title: l.Title  '', published: l.PublishDateTime  '', periodEnd: l.PeriodEndTo || '',
+    url: l.Url ? ('https://codal.ir' + (l.Url.startsWith('http') ? '' : l.Url)) : null,
+    excelUrl: l.ExcelUrl ? ('https://codal.ir' + (l.ExcelUrl.startsWith('http') ? '' : l.ExcelUrl)) : null,
+    tracingNo: l.TracingNo  null, isAudited: l.IsAudited  false
+  };
+}
+async function fetchSymbol(symbol) {
+  const key = 'codal-' + symbol;
+  const cached = store.read(key, null);
+  if (cached && cached.fetchedAt && (Date.now() - cached.fetchedAt) < CACHE_TTL) return { ...cached, fromCache: true, ok: true };
+  try {
+    const financial = await searchReports(symbol, 6);
+    await sleep(1500);
+    const monthly = await searchReports(symbol, 58);
+    const data = { symbol, fetchedAt: Date.now(), ok: true,
+      financial: (financial.Letters || []).slice(0, 10).map(pickFields),
+      monthly: (monthly.Letters || []).slice(0, 12).map(pickFields) };
+    store.write(key, data);
+    return { ...data, fromCache: false };
+  } catch (e) {
+    if (cached) return { ...cached, fromCache: true, ok: true, staleError: String(e.message) };
+    return { symbol, ok: false, error: String(e.message), financial: [], monthly: [] };
+  }
+}
+module.exports = { fetchSymbol, searchReports };
+const http = require('http'), fs = require('fs'), path = require('path'), zlib = require('zlib');
+const store = require('./store'), codalClient = require('./codal');
+const PORT = process.env.PORT || 3000;
+const TMC = 'https://cdn.tsetmc.com/api';
+const HEADERS = { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' };
+const APP_VERSION = '1.0.1', CACHE_NAME = 'mahdiar-' + APP_VERSION;
+
+async function tmc(p) { const r = await fetch(TMC + p, { headers: HEADERS, signal: AbortSignal.timeout(15000) }); if (!r.ok) throw new Error('TMC ' + r.status); return r.json(); }
+const norm = s => String(s || '').replace(/ي/g,'ی').replace(/ك/g,'ک').replace(/\u200c/g,'').trim();
+function jalali(dEven) { const s = String(dEven || '').trim(); let d = new Date(); if (s.length === 8) { const y=+s.slice(0,4),m=+s.slice(4,6),day=+s.slice(6,8); if(y>1300&&m>=1&&m<=12&&day>=1&&day<=31) d = new Date(Date.UTC(y,m-1,day)); } return new Intl.DateTimeFormat('fa-IR',{year:'numeric',month:'2-digit',day:'2-digit'}).format(d); }
+function marketCapText(rial) { if(!rial) return null; const b = rial/1e10; return b>=1000 ? 'حدود '+Math.round(b/1000).toLocaleString('fa-IR')+' هزار میلیارد تومان' : 'حدود '+Math.round(b).toLocaleString('fa-IR')+' میلیارد تومان'; }
+async function symbolData(name, raw) {
+  const search = await tmc('/Instrument/GetInstrumentSearch/' + encodeURIComponent(name));
+  const list = search.instrumentSearch || [];
+  const hit = list.find(x => norm(x.lVal18AFC) === norm(name)) || list[0];
+  if (!hit) return { status: 404, body: { error: 'نماد پیدا نشد' } };
+  const [info, closing] = await Promise.all([ tmc('/Instrument/GetInstrumentInfo/' + hit.insCode), tmc('/ClosingPrice/GetClosingPriceInfo/' + hit.insCode) ]);
+  if (raw) return { status: 200, body: { hit, info, closing } };
+  const i = info.instrumentInfo  {}, c = closing.closingPriceInfo  {};
+  const price = c.pClosing  null, eps = (i.eps && i.eps.estimatedEPS)  null;
+  return { status: 200, body: { symbol: hit.lVal18AFC  name, name: hit.lVal30  name, updated: jalali(c.dEven), marketCap: price && i.zTitad ? marketCapText(price * i.zTitad) : null, eps, pe: price && eps > 0 ? Math.round((price/eps)*10)/10 : null } };
+}
+
+const CRC_TABLE = (()=>{const t=new Uint32Array(256);for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);t[n]=c>>>0}return t})();
+function crc32(buf){let c=0xFFFFFFFF;for(let i=0;i<buf.length;i++)c=CRC_TABLE[(c^buf[i])&0xFF]^(c>>>8);return (c^0xFFFFFFFF)>>>0}
+function pngChunk(type,data){const len=Buffer.alloc(4);len.writeUInt32BE(data.length);const tb=Buffer.from(type,'ascii');const crc=Buffer.alloc(4);crc.writeUInt32BE(crc32(Buffer.concat([tb,data])));return Buffer.concat([len,tb,data,crc])}
+function rasterMahdiar(size,maskable){
+  const SS=4,S=size*SS,R=maskable?0:S*0.22,cx=S/2,cy=S/2,scale=maskable?0.85:1.0;
+  const mPath=[[0.24,0.74],[0.24,0.38],[0.50,0.62],[0.76,0.26],[0.76,0.74]].map(([x,y])=>[x*S,y*S]);
+  const stroke=S*0.12,hs=stroke/2,spCx=S*0.85,spCy=S*0.17,spR=S*0.055;
+  const distSeg=(px,py,x1,y1,x2,y2)=>{const dx=x2-x1,dy=y2-y1,l2=dx*dx+dy*dy;if(l2<1e-6)return Math.hypot(px-x1,py-y1);const t=Math.max(0,Math.min(1,((px-x1)*dx+(py-y1)*dy)/l2));return Math.hypot(px-(x1+t*dx),py-(y1+t*dy))};
+  const inM=(px,py)=>{for(let i=0;i<mPath.length-1;i++){const[x1,y1]=mPath[i],[x2,y2]=mPath[i+1];if(distSeg(px,py,x1,y1,x2,y2)<=hs)return true}for(const[x,y]of mPath)if(Math.hypot(px-x,py-y)<=hs)return true;return false};
+  const inSparkle=(px,py)=>{const dx=Math.abs(px-spCx)/spR,dy=Math.abs(py-spCy)/spR;return Math.pow(dx,0.5)+Math.pow(dy,0.5)<=1};
+  const inRounded=(x,y)=>{if(R===0)return true;if(x<R&&y<R)return(x-R)2+(y-R)2<=R*R;if(x>S-R&&y<R)return(x-(S-R))2+(y-R)2<=R*R;if(x<R&&y>S-R)return(x-R)2+(y-(S-R))2<=R*R;if(x>S-R&&y>S-R)return(x-(S-R))2+(y-(S-R))2<=R*R;return true};
+const bg1=[10,30,77],bg2=[47,111,228],gold=[251,191,36],white=[255,255,255],img=Buffer.alloc(size*size*4),n=SS*SS;
+  for(let py=0;py<size;py++)for(let px=0;px<size;px++){let bgCount=0,mCount=0,sCount=0,rr=0,gg=0,bb=0;for(let sy=0;sy<SS;sy++)for(let sx=0;sx<SS;sx++){const x=px*SS+sx+0.5,y=py*SS+sy+0.5;if(!inRounded(x,y))continue;bgCount++;const t=(x+y)/(2*S);rr+=bg1[0]+(bg2[0]-bg1[0])*t;gg+=bg1[1]+(bg2[1]-bg1[1])*t;bb+=bg1[2]+(bg2[2]-bg1[2])*t;const tx=cx+(x-cx)/scale,ty=cy+(y-cy)/scale;if(inM(tx,ty))mCount++;if(inSparkle(tx,ty))sCount++}const idx=(py*size+px)*4;if(bgCount===0){img[idx+3]=0;continue}const mf=mCount/n,sf=sCount/n;let cr=rr/bgCount,cg=gg/bgCount,cb=bb/bgCount;cr=cr*(1-mf)+white[0]*mf;cg=cg*(1-mf)+white[1]*mf;cb=cb*(1-mf)+white[2]*mf;cr=cr*(1-sf)+gold[0]*sf;cg=cg*(1-sf)+gold[1]*sf;cb=cb*(1-sf)+gold[2]*sf;img[idx]=Math.round(cr);img[idx+1]=Math.round(cg);img[idx+2]=Math.round(cb);img[idx+3]=Math.round((bgCount/n)*255)}
+  const ihdr=Buffer.alloc(13);ihdr.writeUInt32BE(size,0);ihdr.writeUInt32BE(size,4);ihdr[8]=8;ihdr[9]=6;const stride=size*4,raw=Buffer.alloc(size*(stride+1));for(let y=0;y<size;y++){raw[y*(stride+1)]=0;img.copy(raw,y*(stride+1)+1,y*stride,(y+1)*stride)}return Buffer.concat([Buffer.from([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]),pngChunk('IHDR',ihdr),pngChunk('IDAT',zlib.deflateSync(raw,{level:9})),pngChunk('IEND',Buffer.alloc(0))])
+}
+const iconCache=new Map();
+function getIcon(size,maskable){const key=size+':'+(maskable?'m':'a');if(!iconCache.has(key))iconCache.set(key,rasterMahdiar(size,maskable));return iconCache.get(key)}
+function manifest(){return{name:'مهدیار — تحلیل بنیادی سهام',short_name:'مهدیار',description:'تحلیل بنیادی سهام بورس تهران',lang:'fa',dir:'rtl',start_url:'/?src=pwa',scope:'/',display:'standalone',display_override:['standalone','minimal-ui'],orientation:'portrait-primary',background_color:'#0a1e4d',theme_color:'#14388a',categories:['finance','business'],icons:[{src:'/icons/icon-192.png',sizes:'192x192',type:'image/png',purpose:'any'},{src:'/icons/icon-512.png',sizes:'512x512',type:'image/png',purpose:'any'},{src:'/icons/maskable-512.png',sizes:'512x512',type:'image/png',purpose:'maskable'}],shortcuts:[{name:'نوری',short_name:'نوری',description:'تحلیل پتروشیمی نوری',url:'/?symbol='+encodeURIComponent('نوری')},{name:'فولاد',short_name:'فولاد',description:'تحلیل فولاد مبارکه',url:'/?symbol='+encodeURIComponent('فولاد')}]}}
+
+const SW_SOURCE = const CACHE='${CACHE_NAME}';const SHELL=['/','/manifest.webmanifest','/icons/icon-192.png','/icons/icon-512.png','/icons/apple-touch-icon.png'];
+self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL)).catch(()=>{}).then(()=>self.skipWaiting()))});
+self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()))});
+self.addEventListener('fetch',e=>{const req=e.request;if(req.method!=='GET')return;const url=new URL(req.url);if(url.origin!==location.origin)return;
+if(url.pathname.startsWith('/api/')){e.respondWith((async()=>{try{const fresh=await fetch(req);const cache=await caches.open(CACHE);cache.put(req,fresh.clone()).catch(()=>{});return fresh}catch{const cached=await caches.match(req);if(cached)return cached;return new Response(JSON.stringify({error:'offline'}),{status:503,headers:{'Content-Type':'application/json'}})}})());return}
+if(req.mode==='navigate'){e.respondWith((async()=>{try{const fresh=await fetch(req);const cache=await caches.open(CACHE);cache.put('/',fresh.clone()).catch(()=>{});return fresh}catch{return(await caches.match('/'))||new Response('آفلاین',{status:503})}})());return}
+e.respondWith((async()=>{const cached=await caches.match(req);if(cached)return cached;try{const fresh=await fetch(req);const cache=await caches.open(CACHE);cache.put(req,fresh.clone()).catch(()=>{});return fresh}catch{return new Response('',{status:504})}})())});;
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+  const json = (status, obj, extra = {}) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...extra }); res.end(JSON.stringify(obj)); };
+  try {
+    if (url.pathname.startsWith('/api/symbol/')) { const name = decodeURIComponent(url.pathname.slice('/api/symbol/'.length)); const out = await symbolData(name, url.searchParams.get('raw') === '1'); return json(out.status, out.body, { 'Cache-Control': 'public, max-age=30' }); }
+    if (url.pathname.startsWith('/api/fundamental/')) {
+      const name = decodeURIComponent(url.pathname.slice('/api/fundamental/'.length));
+      let tmcData = null; try { const out = await symbolData(name, false); if (out.status === 200) tmcData = out.body; } catch (e) {}
+      const manual = store.read('manual-' + name, null);
+      let codal = null; try { codal = await codalClient.fetchSymbol(name); } catch (e) { codal = { symbol: name, ok: false, error: String(e.message), financial: [], monthly: [] }; }
+      const merged = { symbol: (tmcData && tmcData.symbol)  (manual && manual.symbol)  name, name: (tmcData && tmcData.name)  (manual && manual.name)  name, updated: (tmcData && tmcData.updated)  (manual && manual.updated)  null, marketCap: (tmcData && tmcData.marketCap)  (manual && manual.marketCap)  null, pe: (tmcData && tmcData.pe) != null ? tmcData.pe : (manual && manual.pe), eps: (tmcData && tmcData.eps) != null ? tmcData.eps : (manual && manual.eps), kpi: (manual && manual.kpi)  null, trend: (manual && manual.trend)  null, mix: (manual && manual.mix)  null, pl: (manual && manual.pl)  null, health: (manual && manual.health)  null, summary: (manual && manual.summary)  null, codal: { ok: !!(codal && codal.ok), fromCache: !!(codal && codal.fromCache), error: (codal && codal.error)  null, financial: (codal && codal.financial)  [], monthly: (codal && codal.monthly) || [] }, _sources: { tmc: !!tmcData, manual: !!manual, codal: !!(codal && codal.ok) } };
+      return json(200, merged, { 'Cache-Control': 'public, max-age=60' });
+    }
+    if (url.pathname === '/manifest.webmanifest' || url.pathname === '/manifest.json') { res.writeHead(200, { 'Content-Type': 'application/manifest+json; charset=utf-8', 'Cache-Control': 'public, max-age=3600' }); return res.end(JSON.stringify(manifest())); }
+    if (url.pathname === '/sw.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/' }); return res.end(SW_SOURCE); }
+    const iconMatch = url.pathname.match(/^\/icons\/(icon-192|icon-512|maskable-512|apple-touch-icon)\.png$/);
+    if (iconMatch) { const cfg = { 'icon-192': [192, false], 'icon-512': [512, false], 'maskable-512': [512, true], 'apple-touch-icon': [180, true] }[iconMatch[1]]; const png = getIcon(cfg[0], cfg[1]); res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': png.length, 'Cache-Control': 'public, max-age=31536000, immutable' }); return res.end(png); }
+    if (url.pathname === '/icon-192.png') { const p = getIcon(192,false); res.writeHead(200,{'Content-Type':'image/png','Cache-Control':'public, max-age=31536000'}); return res.end(p); }
+    if (url.pathname === '/icon-512.png') { const p = getIcon(512,false); res.writeHead(200,{'Content-Type':'image/png','Cache-Control':'public, max-age=31536000'}); return res.end(p); }
+    const htmlPath = path.join(__dirname, 'mahdiar.html');
+    let html = fs.readFileSync(htmlPath, 'utf8').replace("const API_BASE = '';", "const API_BASE = '/api';");
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+    return res.end(html);
+  } catch (e) { console.error(e); return json(502, { error: String(e.message || e) }); }
+});
+server.listen(PORT, () => { console.log('مهدیار → http://localhost:' + PORT); });
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>مهدیار | تحلیل بنیادی سهام</title>
+<meta name="theme-color" content="#14388a">
+<meta name="application-name" content="مهدیار">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="مهدیار">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#eef3fb;--card:#fff;--ink:#12233f;--mut:#5b6b86;--line:#dbe4f3;--brand:#14388a;--brand2:#2f6fe4;--up:#16a34a;--warn:#f59e0b;--vio:#7c5cd6;--okbg:#eaf7ee;--okline:#b7e4c4;color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0b1220;--card:#131c2f;--ink:#e8eefb;--mut:#93a3bf;--line:#243250;--brand:#2a4fa8;--brand2:#6a9bff;--okbg:#10261a;--okline:#1d5b36;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#0b1220;--card:#131c2f;--ink:#e8eefb;--mut:#93a3bf;--line:#243250;--brand:#2a4fa8;--brand2:#6a9bff;--okbg:#10261a;--okline:#1d5b36;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:Vazirmatn,Tahoma,"Segoe UI",sans-serif;line-height:1.7}
+.wrap{max-width:560px;margin:0 auto;padding:12px}
+.hero{background:linear-gradient(135deg,#0a1e4d,#2f6fe4);color:#fff;border-radius:18px;padding:18px}
+.hero h1{margin:0;font-size:22px;font-weight:800}
+.hero p{margin:2px 0 12px;font-size:13px;opacity:.85}
+.search{display:flex;gap:8px;background:#fff;border-radius:14px;padding:6px}
+.search input{flex:1;border:0;outline:0;background:transparent;font:inherit;font-size:16px;font-weight:600;color:#12233f;padding:6px 10px;min-width:0}
+.search button{border:0;background:#14388a;color:#fff;border-radius:10px;font:inherit;font-weight:600;padding:6px 16px;cursor:pointer}
+.note{margin:10px 0 0;font-size:12px;background:rgba(255,255,255,.16);border-radius:10px;padding:6px 10px}
+.banner{margin-top:8px;font-size:12.5px;background:rgba(245,158,11,.15);color:#fde68a;border:1px solid rgba(245,158,11,.35);border-radius:10px;padding:6px 10px;text-align:center}
+.install{margin-top:10px;width:100%;border:0;background:rgba(255,255,255,.16);color:#fff;border-radius:12px;padding:10px;font:inherit;font-weight:600;cursor:pointer;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.install:active{background:rgba(255,255,255,.28)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin-top:12px}
+.chip{display:inline-block;background:var(--brand);color:#fff;font-weight:600;font-size:14px;border-radius:10px;padding:2px 12px;margin-bottom:10px}
+.grid{display:grid;gap:10px}.g2{grid-template-columns:1fr 1fr}
+.stat{background:var(--bg);border-radius:12px;padding:10px}
+.stat small{display:block;color:var(--mut);font-size:12px}
+.stat b{font-size:17px;font-weight:800}
+.kpi{background:var(--bg);border-radius:12px;padding:10px;min-height:76px}
+.kpi small{display:block;color:var(--mut);font-size:12px;line-height:1.5}
+.kpi b{font-size:20px;font-weight:800}
+.up{color:var(--up)}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td{padding:9px 6px;border-top:1px solid var(--line)}
+td:last-child{text-align:left;font-weight:600;direction:ltr}
+.bar{margin:10px 0}
+.bar .row{display:flex;justify-content:space-between;font-size:13px}
+.bar .track{height:9px;background:var(--bg);border-radius:9px;margin-top:4px;overflow:hidden}
+.bar .fill{height:100%;border-radius:9px}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px;margin-top:6px}
+.legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-inline-end:5px;vertical-align:-1px}
+.sum{background:var(--okbg);border-color:var(--okline)}
+.sum h3{margin:0 0 4px;color:var(--up);font-size:16px}
+.sum p{margin:0;font-size:14px}
+.foot{font-size:11.5px;color:var(--mut);text-align:center;margin:14px 6px 8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>مهدیار · تحلیل بنیادی سهام</h1>
+    <p>نماد را وارد کنید تا خلاصهٔ وضعیت بنیادی آن را ببینید</p>
+    <div class="search">
+      <input id="q" value="نوری" placeholder="نماد، مثلاً نوری" aria-label="نماد" autocomplete="off">
+      <button id="go">تحلیل</button>
+    </div>
+    <div class="note" id="note"></div>
+    <div class="banner" id="offline" hidden>آفلاین هستید — داده‌های ذخیره‌شده نمایش داده می‌شوند</div>
+    <button class="install" id="install" hidden>:calling: نصب روی دستگاه</button>
+  </div>
+  <div id="out"></div>
+  <p class="foot">مهدیار — نسخهٔ ۱.۰ · ساخته‌شده با :heart:︎<br>منبع قیمت و سهام: TMC · منبع صورت‌های مالی: کدال. این صفحه توصیهٔ خرید یا فروش نیست.</p>
+</div>
+
+<script>
+const API_BASE = '';
+
+const SAMPLE = {
+  symbol:'نوری', name:'پتروشیمی نوری', updated:'۱۴۰۵/۰۶/۳۱',
+  marketCap:'حدود ۲۸۰ هزار میلیارد تومان', pe:6.8, eps:2576,
+  kpi:[
+    {t:'رشد فروش آخرین ماه نسبت به سال قبل',v:12,up:1,s:'+'},
+    {t:'رشد فروش آخرین ماه نسبت به ماه قبل',v:8,up:1,s:'+'},
+    {t:'رشد سود خالص',v:266,up:1,s:'+'},
+    {t:'رشد درآمد عملیاتی',v:154,up:1,s:'+'},
+    {t:'حاشیه سود ناخالص',v:33.7},
+    {t:'حاشیه سود خالص',v:18.1},
+    {t:'نسبت جاری',v:1.02,raw:1},
+    {t:'بازده حقوق صاحبان سهام (ROE)',v:18.5}
+  ],
+  trend:{labels:['۱۴۰۱','۱۴۰۲','۱۴۰۳','۱۴۰۴','۱۴۰۵ (۶ماهه)'],revenue:[800,900,1080,1170,1350],profit:[470,550,630,780,950]},
+  mix:[{n:'بنزین',v:25,c:'#2f6fe4'},{n:'رافینیت',v:35,c:'#f59e0b'},{n:'پارازایلین',v:15,c:'#22a35a'},{n:'سایر محصولات',v:25,c:'#7c5cd6'}],
+  pl:[['درآمد عملیاتی',1366586060],['سود ناخالص',460302960],['سود عملیاتی',310093138],['سود خالص',247267825]],
+  health:[{n:'نسبت جاری',v:1.02,pct:51,c:'#2f6fe4',raw:1},{n:'بدهی به دارایی',v:62,pct:62,c:'#22a35a'},{n:'حاشیه سود عملیاتی',v:22.7,pct:22.7,c:'#f59e0b'},{n:'بازده دارایی‌ها (ROA)',v:13.6,pct:13.6,c:'#7c5cd6'}],
+  summary:'پتروشیمی نوری با برخورداری از مزیت‌های رقابتی، موقعیت مناسب در زنجیرهٔ ارزش و رشد پایدار فروش، در میان شرکت‌های برتر صنعت پتروشیمی قرار دارد.'
+};
+
+async function getData(sym) {
+  if (!API_BASE) return { d: SAMPLE, live: false, reason: 'demo' };
+  try {
+    const r = await fetch(API_BASE + '/fundamental/' + encodeURIComponent(sym), { cache: 'no-store' });
+    if (r.ok) {
+      const data = await r.json();
+      return { d: data, live: data._sources && data._sources.tmc, reason: null };
+    }
+    if (r.status === 404) return { d: SAMPLE, live: false, reason: 'not-found' };
+    if (r.status >= 500) return { d: SAMPLE, live: false, reason: 'offline' };
+    return { d: SAMPLE, live: false, reason: 'error' };
+  } catch (e) {
+    return { d: SAMPLE, live: false, reason: 'offline' };
+  }
+}
+
+const esc  = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fa   = (n, p) => Number(n).toLocaleString('fa-IR', { maximumFractionDigits: p == null ? 2 : p });
+const dash = (v, f) => v == null ? '—' : f(v);
+
+function barChart(t){
+  const max = 1500, base = 160, h = 130, x0 = 44, gw = 54;
+  let g = '';
+  [0,500,1000,1500].forEach(v => {
+    const y = base - v/max*h;
+    g += <line x1="${x0-4}" x2="316" y1="${y}" y2="${y}" stroke="var(--line)"/><text x="${x0-8}" y="${y+4}" font-size="10" text-anchor="end" fill="var(--mut)">${fa(v,0)}</text>;
+});
+  t.labels.forEach((l,i) => {
+    const x = x0 + i*gw + 8;
+    const r = t.revenue[i]/max*h, p = t.profit[i]/max*h;
+    g += <rect x="${x}" y="${base-r}" width="17" height="${r}" rx="2" fill="#2a56b8"/><rect x="${x+19}" y="${base-p}" width="17" height="${p}" rx="2" fill="#f59e0b"/><text x="${x+18}" y="178" font-size="9" text-anchor="middle" fill="var(--mut)">${esc(l)}</text>;
+  });
+  return <div class="scroll"><svg viewBox="0 0 320 186" width="100%" style="direction:ltr;min-width:300px" role="img" aria-label="روند درآمد و سود خالص">${g}</svg></div>
+  <div class="legend"><span><i style="background:#2a56b8"></i>درآمد عملیاتی</span><span><i style="background:#f59e0b"></i>سود خالص</span></div>;
+}
+
+function donut(mix){
+  const r = 40, C = 2*Math.PI*r; let acc = 0, s = '';
+  mix.forEach(m => {
+    const len = m.v/100*C;
+    s += <circle cx="60" cy="60" r="${r}" fill="none" stroke="${m.c}" stroke-width="18" stroke-dasharray="${len} ${C-len}" stroke-dashoffset="${-acc}" transform="rotate(-90 60 60)"/>;
+    acc += len;
+  });
+  const lg = mix.map(m => <span><i style="background:${m.c}"></i>${esc(m.n)} (${fa(m.v,0)}٪)</span>).join('');
+  return <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+    <svg viewBox="0 0 120 120" width="150" height="150" role="img" aria-label="ترکیب فروش محصولات">${s}<text x="60" y="57" text-anchor="middle" font-size="9" font-weight="700" fill="var(--ink)">مهم‌ترین</text><text x="60" y="69" text-anchor="middle" font-size="9" font-weight="700" fill="var(--ink)">محصولات</text></svg>
+    <div class="legend" style="flex-direction:column;gap:6px">${lg}</div></div>;
+}
+
+function render(d, live, sym, reason){
+  const note = document.getElementById('note');
+  if (live) {
+    note.textContent = 'داده زنده از TMC + کدال';
+  } else if (reason === 'offline') {
+    note.textContent = 'اتصال برقرار نیست؛ دادهٔ نمونه نمایش داده می‌شود.';
+  } else if (reason === 'not-found') {
+    note.textContent = نماد «${sym}» پیدا نشد؛ نمونهٔ «${d.symbol}» نمایش داده می‌شود.;
+  } else if (reason === 'error') {
+    note.textContent = 'خطا در دریافت داده؛ نمونه نمایش داده می‌شود.';
+  } else {
+    note.textContent = 'نمایش داده نمونه · اتصال به سرور داده برقرار نیست.';
+  }
+
+  const kpis = (d.kpi || []).map(k => {
+    const val = k.raw ? fa(k.v) : (k.s || '') + fa(k.v, 1) + '٪';
+    return <div class="kpi"><small>${esc(k.t)}</small><b class="${k.up ? 'up' : ''}">${k.up ? '▲ ' : ''}${val}</b></div>;
+  }).join('');
+  const pl = (d.pl || []).map(r => <tr><td>${esc(r[0])}</td><td>${fa(r[1],0)}</td></tr>).join('');
+  const hl = (d.health || []).map(h => <div class="bar"><div class="row"><span>${esc(h.n)}</span><b>${h.raw ? fa(h.v) : fa(h.v,1) + '٪'}</b></div><div class="track"><div class="fill" style="width:${h.pct}%;background:${h.c}"></div></div></div>).join('');
+
+  document.getElementById('out').innerHTML = 
+  <div class="card"><div class="chip">${esc(d.name)} · ${esc(d.symbol)}</div>
+    <div class="grid g2">
+      <div class="stat"><small>آخرین بروزرسانی</small><b>${dash(d.updated, esc)}</b></div>
+      <div class="stat"><small>ارزش بازار</small><b style="font-size:14px">${dash(d.marketCap, esc)}</b></div>
+      <div class="stat"><small>P/E</small><b>${dash(d.pe, v => fa(v,1))}</b></div>
+      <div class="stat"><small>EPS (ریال)</small><b>${dash(d.eps, v => fa(v,0))}</b></div>
+    </div></div>
+  ${kpis ? <div class="card"><div class="chip">شاخص‌های کلیدی عملکرد</div><div class="grid g2">${kpis}</div></div> : ''}
+  ${d.trend ? <div class="card"><div class="chip">روند عملکرد شرکت</div>${barChart(d.trend)}</div> : ''}
+  ${d.mix ? <div class="card"><div class="chip">ترکیب فروش محصولات</div>${donut(d.mix)}</div> : ''}
+  ${pl ? <div class="card"><div class="chip">صورت سود و زیان (خلاصه)</div><div style="font-size:12px;color:var(--mut)">مبلغ (میلیون ریال)</div><table>${pl}</table></div>` : ''}
+${hl ? <div class="card"><div class="chip">وضعیت مالی و نقدینگی</div>${hl}</div> : ''}
+  ${d.codal && (d.codal.financial?.length || d.codal.monthly?.length) ? 
+    <div class="card">
+      <div class="chip">آخرین گزارش‌های کدال</div>
+      ${d.codal.ok === false && d.codal.error ? <div style="font-size:12px;color:var(--warn);margin-bottom:8px">:warning: ${esc(d.codal.error)}</div> : ''}
+      ${d.codal.financial?.length ? 
+        <div style="font-size:13px;color:var(--mut);margin:8px 0 4px">صورت‌های مالی</div>
+        <table>${d.codal.financial.slice(0, 5).map(r => 
+          <tr>
+            <td>${esc(r.title)}<br><small style="color:var(--mut)">${esc(r.published)}</small></td>
+            <td>${r.url ? <a href="${esc(r.url)}" target="_blank" style="color:var(--brand2);text-decoration:none">مشاهده :arrow_upper_right:</a> : '—'}</td>
+          </tr>).join('')}</table> : ''}
+      ${d.codal.monthly?.length ? 
+        <div style="font-size:13px;color:var(--mut);margin:14px 0 4px">گزارش فعالیت ماهانه</div>
+        <table>${d.codal.monthly.slice(0, 5).map(r => 
+          <tr>
+            <td>${esc(r.title)}<br><small style="color:var(--mut)">${esc(r.published)}</small></td>
+            <td>${r.url ? <a href="${esc(r.url)}" target="_blank" style="color:var(--brand2);text-decoration:none">مشاهده :arrow_upper_right:</a> : '—'}</td>
+          </tr>).join('')}</table> : ''}
+      ${d.codal.fromCache ? '<div style="font-size:11px;color:var(--mut);margin-top:8px">📦 از کش محلی</div>' : ''}
+    </div> : ''}
+  ${d.summary ? <div class="card sum"><h3>✓ جمع‌بندی</h3><p>${esc(d.summary)}</p></div> : ''}`;
+}
+
+async function run(){
+  const sym = document.getElementById('q').value.trim();
+  if (!sym) return;
+  document.getElementById('out').innerHTML =
+    '<div class="card" style="text-align:center;color:var(--mut);padding:30px">در حال دریافت…</div>';
+  const { d, live, reason } = await getData(sym);
+  render(d, live, sym, reason);
+}
+
+let deferredPrompt = null;
+const installBtn = document.getElementById('install');
+
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  if (installBtn) installBtn.hidden = false;
+});
+
+if (installBtn) {
+  installBtn.addEventListener('click', async () => {
+    if (deferredPrompt) {
+      deferredPrompt.prompt();
+      await deferredPrompt.userChoice;
+      deferredPrompt = null;
+      installBtn.hidden = true;
+      return;
+    }
+    alert('در Chrome: منوی ⋮ → Install app\nدر Safari: Share → Add to Home Screen');
+  });
+}
+
+window.addEventListener('appinstalled', () => {
+  deferredPrompt = null;
+  if (installBtn) installBtn.hidden = true;
+});
+
+(function iosHint(){
+  const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const standalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone;
+  if (isIOS && !standalone && installBtn) {
+    installBtn.hidden = false;
+    installBtn.textContent = ':calling: راهنمای نصب (Safari)';
+    installBtn.addEventListener('click', () => {
+      alert('در Safari: دکمهٔ Share (مربع با فلش رو به بالا) → Add to Home Screen.');
+    }, { once: true });
+  }
+})();
+
+const offlineEl = document.getElementById('offline');
+function updateOnline() { if (offlineEl) offlineEl.hidden = navigator.onLine; }
+window.addEventListener('online', updateOnline);
+window.addEventListener('offline', updateOnline);
+updateOnline();
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  });
+}
+
+const initSym = new URLSearchParams(location.search).get('symbol');
+if (initSym) document.getElementById('q').value = initSym;
+document.getElementById('go').addEventListener('click', run);
+document.getElementById('q').addEventListener('keydown', e => { if (e.key === 'Enter') run(); });
+run();
+</script>
+</body>
+</html>
